@@ -1,0 +1,227 @@
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import hydroeval as he
+
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.model_selection import train_test_split
+from keras.preprocessing.sequence import TimeseriesGenerator
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import SGD, RMSprop, Adam, Adadelta, Adagrad, Adamax, Nadam
+
+import keras_tuner as kt
+import time
+from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.losses import MeanSquaredError, MeanAbsoluteError
+from tensorflow.keras.metrics import RootMeanSquaredError
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+# Load your dataset
+def load_dataset(path):
+    return pd.read_csv(path)
+
+file_path = "/content/drive/MyDrive/Colab_Notebooks/Dataset/stockdata.csv"
+df_stock = load_dataset(file_path)
+
+# Assuming your dataset has the following columns: Date, Open, High, Low, Ltp, Change, Qty, Turnover
+features = ['Date', 'Open', 'High', 'Low', 'Ltp', 'Change', 'Qty', 'Turnover']
+df_stock = df_stock[features]
+
+import datetime
+
+def str_to_datetime(s):
+    split = s.split('/')
+    day, month, year = int(split[0]), int(split[1]), int(split[2])
+    return datetime.datetime(year=year, month=month, day=day)
+
+df_stock['Date'] = df_stock['Date'].apply(str_to_datetime)
+
+# Scaling the data
+df_input = df_stock[['Open', 'High', 'Low', 'Ltp', 'Change', 'Qty', 'Turnover']]
+
+def min_max_scaling(data):
+    min_val = np.min(data)
+    max_val = np.max(data)
+    scaled_data = (data - min_val) / (max_val - min_val)
+    return scaled_data, min_val, max_val
+
+columns_to_scale = ['Open', 'High', 'Low', 'Ltp', 'Change', 'Qty', 'Turnover']
+scaled_df = df_input.copy()
+
+for column in columns_to_scale:
+    scaled_df[column], _, _ = min_max_scaling(df_input[column])
+
+print(scaled_df)
+
+def df_to_X_y(df, window_size=5):
+    df_as_np = df.to_numpy()
+    X = []
+    y = []
+    for i in range(len(df_as_np) - window_size):
+        row = [r for r in df_as_np[i:i + window_size]]
+        X.append(row)
+        label = df_as_np[i + window_size][0]  # Predicting 'Open' price
+        y.append(label)
+    return np.array(X), np.array(y)
+
+WINDOW_SIZE = 2
+X, y = df_to_X_y(scaled_df, WINDOW_SIZE)
+X.shape, y.shape
+
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from tensorflow import keras
+from tensorflow.keras import layers
+
+def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0):
+    x = layers.LayerNormalization(epsilon=1e-6)(inputs)
+    x = layers.MultiHeadAttention(key_dim=head_size, num_heads=num_heads, dropout=dropout)(x, x)
+    x = layers.Dropout(dropout)(x)
+    res = x + inputs
+
+    x = layers.LayerNormalization(epsilon=1e-6)(res)
+    x = layers.Conv1D(filters=ff_dim, kernel_size=1, activation="relu")(x)
+    x = layers.Dropout(dropout)(x)
+    x = layers.Conv1D(filters=inputs.shape[-1], kernel_size=1)(x)
+    return x + res
+
+from tensorflow.keras.callbacks import EarlyStopping
+
+def build_model(hp):
+    inputs = keras.Input(shape=input_shape)
+    x = inputs
+
+    for i in range(hp.Int('num_transformer_blocks', min_value=2, max_value=8, step=2)):
+        x = transformer_encoder(x,
+                                hp.Int('head_size', min_value=8, max_value=256, step=32),
+                                hp.Int('num_heads', min_value=2, max_value=16),
+                                hp.Int('ff_dim', min_value=4, max_value=64),
+                                hp.Float(f'dropout_{i}', min_value=0.1, max_value=0.6))
+
+    x = layers.GlobalAveragePooling1D(data_format="channels_first")(x)
+
+    for i in range(hp.Int('num_mlp_layers', min_value=1, max_value=3)):
+        x = layers.Dense(hp.Int(f'mlp_units_{i}', min_value=32, max_value=256, step=32))(x)
+        x = layers.Activation('relu')(x)
+        x = layers.Dropout(hp.Float(f'mlp_dropout_{i}', min_value=0.1, max_value=0.6))(x)
+
+    outputs = layers.Dense(1)(x)
+    model = keras.Model(inputs, outputs)
+
+    optimizer = hp.Choice('optimizer', values=['adam', 'adamax'])
+    learning_rate = hp.Float('learning_rate', min_value=1e-4, max_value=1e-2)
+
+    if optimizer == 'adam':
+        opt = Adam(learning_rate=learning_rate)
+    else:
+        opt = Adamax(learning_rate=learning_rate, beta_1=0.9, beta_2=0.999)
+
+    model.compile(optimizer=opt, loss=MeanSquaredError(), metrics=['mae', RootMeanSquaredError()])
+
+    return model
+
+input_shape = X.shape[1:]
+
+best_model_hyperparameters = None
+best_model_mae = float('inf')
+
+worst_model_hyperparameters = None
+worst_model_mae = float('-inf')
+
+outer_cv = KFold(n_splits=5, shuffle=True, random_state=42)
+nested_scores = []
+
+for fold_outer_idx, (train_ix, test_ix) in enumerate(outer_cv.split(X)):
+    X_train_outer, X_test_outer = X[train_ix], X[test_ix]
+    y_train_outer, y_test_outer = y[train_ix], y[test_ix]
+
+    inner_cv = KFold(n_splits=3, shuffle=True, random_state=42)
+
+    for fold_idx, (train_ix_inner, val_ix) in enumerate(inner_cv.split(X_train_outer)):
+        X_train_inner, X_val = X_train_outer[train_ix_inner], X_train_outer[val_ix]
+        y_train_inner, y_val = y_train_outer[train_ix_inner], y_train_outer[val_ix]
+
+        tuner = kt.RandomSearch(
+            build_model,
+            objective='val_loss',
+            max_trials=15,
+            directory=f'/content/drive/MyDrive/research/keras_tuner_random_dir_fold_stock_{fold_outer_idx}_{fold_idx}',
+            project_name=f'/content/drive/MyDrive/research/hyperparameter_random_tuning_fold_stock_{fold_outer_idx}_{fold_idx}'
+        )
+
+        tuner.search(X_train_inner, y_train_inner, validation_data=(X_val, y_val), epochs=30)
+
+        best_hps = tuner.oracle.get_best_trials(1)[0].hyperparameters
+        print(f"Best hyperparameters for fold {fold_idx}: {best_hps}")
+
+        model = build_model(best_hps)
+        es = [keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True)]
+
+        model.fit(X_train_inner, y_train_inner, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[es])
+
+        y_pred = model.predict(X_val)
+        mae = mean_squared_error(y_val, y_pred)
+
+        if mae < best_model_mae:
+            best_model_mae = mae
+            best_model_hyperparameters = best_hps
+            best_model = model
+
+        if mae > worst_model_mae:
+            worst_model_mae = mae
+            worst_model_hyperparameters = best_hps
+            worst_model = model
+
+    start_time = time.time()
+    y_pred_best = best_model.predict(X_test_outer)
+    y_pred_worst = worst_model.predict(X_test_outer)
+    end_time = time.time()
+
+    mse_best = mean_squared_error(y_test_outer, y_pred_best)
+    mae_best = mean_absolute_error(y_test_outer, y_pred_best)
+    rmse_best = np.sqrt(mse_best)
+
+    nse_best = he.evaluator(he.nse, y_pred_best, y_test_outer)
+    kge_best, r, alpha, beta = he.evaluator(he.kge, y_pred_best, y_test_outer)
+    print("Best Model:")
+    print("KGE : ", kge_best)
+
+    r2_best = r2_score(y_test_outer, y_pred_best)
+    time_duration = end_time - start_time
+
+    mse_worst = mean_squared_error(y_test_outer, y_pred_worst)
+    mae_worst = mean_absolute_error(y_test_outer, y_pred_worst)
+    rmse_worst = np.sqrt(mse_worst)
+
+    nse_worst = he.evaluator(he.nse, y_pred_worst, y_test_outer)
+    kge_worst, r, alpha, beta = he.evaluator(he.kge, y_pred_worst, y_test_outer)
+    print("Worst Model:")
+    print("KGE : ", kge_worst)
+
+    r2_worst = r2_score(y_test_outer, y_pred_worst)
+
+    print(f"Fold {fold_outer_idx} - Best Model MSE: {mse_best}, R2: {r2_best}")
+    print(f"Fold {fold_outer_idx} - Worst Model MSE: {mse_worst}, R2: {r2_worst}")
+
+    nested_scores.append({
+        'fold': fold_outer_idx,
+        'best_mse': mse_best,
+        'best_mae': mae_best,
+        'best_rmse': rmse_best,
+        'best_nse': nse_best,
+        'best_kge': kge_best,
+        'best_r2': r2_best,
+        'best_hyperparameters': best_model_hyperparameters,
+        'worst_mse': mse_worst,
+        'worst_mae': mae_worst,
+        'worst_rmse': rmse_worst,
+        'worst_nse': nse_worst,
+        'worst_kge': kge_worst,
+        'worst_r2': r2_worst,
+        'worst_hyperparameters': worst_model_hyperparameters,
+        'prediction_duration': time_duration
+    })
